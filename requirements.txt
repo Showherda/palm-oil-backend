@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+numpy
+opencv-python-headless
+pillow
+vercel_blob
