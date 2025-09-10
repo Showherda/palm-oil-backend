@@ -1,8 +1,7 @@
 fastapi
 uvicorn
-numpy
-opencv-python-headless
 pillow
+pyzbar
 vercel_blob
 python-dotenv
 asyncpg

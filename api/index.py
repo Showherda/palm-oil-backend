@@ -4,11 +4,10 @@
 
 import os, io, base64, time, hashlib, json, logging
 from typing import Optional, List, Dict, Any
-import numpy as np
-import cv2
 from fastapi import FastAPI, Request, HTTPException
 import vercel_blob  # community wrapper; reads BLOB_READ_WRITE_TOKEN env var
 from PIL import Image
+from pyzbar import pyzbar
 import asyncpg
 import asyncio
 from dotenv import load_dotenv
@@ -91,49 +90,27 @@ def b64_to_bytes(b64: str) -> bytes:
         b64 = b64.split(",",1)[1]
     return base64.b64decode(b64)
 
-# QR code detection using OpenCV - returns decoded string or None
-_qr = cv2.QRCodeDetector()
-
+# QR code detection using pyzbar - returns decoded string or None
 def decode_qr(img_bytes: bytes) -> Optional[str]:
-    """Decode QR code from image bytes using OpenCV with PIL fallback"""
+    """Decode QR code from image bytes using pyzbar"""
     logger.debug(f"Attempting to decode QR code from {len(img_bytes)} bytes")
     
-    # Convert bytes to OpenCV image array
-    arr = np.frombuffer(img_bytes, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    
-    if img is None:
-        # Fallback to PIL if OpenCV fails to decode
-        logger.debug("OpenCV decode failed, trying PIL fallback")
-        try:
-            pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            arr = np.array(pil)[:, :, ::-1]  # RGB to BGR conversion
-            img = arr
-        except Exception as e:
-            logger.error(f"PIL fallback failed: {e}")
-            return None
-    
-    # Try multi-decode first (handles multiple QR codes)
     try:
-        ok, decoded_info, points, straight_qrcode = _qr.detectAndDecodeMulti(img)
-        if ok and decoded_info:
-            logger.debug(f"Multi-decode successful: {decoded_info}")
-            # Return first decoded QR code (should contain treeId)
-            result = decoded_info[0] if isinstance(decoded_info, (list,tuple)) else decoded_info
-            logger.info(f"QR code decoded successfully: {result[:50]}...")  # Log first 50 chars
-            return result
-    except Exception as e:
-        logger.debug(f"Multi-decode failed: {e}")
-    
-    # Fallback to single decode
-    try:
-        text, pts = _qr.detectAndDecode(img)
-        if text:
-            logger.info(f"Single QR decode successful: {text[:50]}...")  # Log first 50 chars
-            return text
+        # Open image with PIL
+        pil_image = Image.open(io.BytesIO(img_bytes))
+        
+        # Decode QR codes using pyzbar
+        decoded_objects = pyzbar.decode(pil_image)
+        
+        if decoded_objects:
+            # Return the first QR code found
+            qr_data = decoded_objects[0].data.decode('utf-8')
+            logger.info(f"QR code decoded successfully: {qr_data[:50]}...")  # Log first 50 chars
+            return qr_data
         else:
             logger.debug("No QR code detected in image")
             return None
+            
     except Exception as e:
         logger.error(f"QR decode failed: {e}")
         return None
