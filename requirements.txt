@@ -4,3 +4,5 @@ numpy
 opencv-python-headless
 pillow
 vercel_blob
+asyncpg
+python-dotenv
