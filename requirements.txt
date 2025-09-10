@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 pillow
-pyzbar
+qreader
 vercel_blob
 python-dotenv
 asyncpg

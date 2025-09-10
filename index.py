@@ -7,7 +7,7 @@ from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Request, HTTPException
 import vercel_blob  # community wrapper; reads BLOB_READ_WRITE_TOKEN env var
 from PIL import Image
-from pyzbar import pyzbar
+from qreader import QReader
 import asyncpg
 import asyncio
 from dotenv import load_dotenv
@@ -92,20 +92,22 @@ def b64_to_bytes(b64: str) -> bytes:
 
 # QR code detection using pyzbar - returns decoded string or None
 def decode_qr(img_bytes: bytes) -> Optional[str]:
-    """Decode QR code from image bytes using pyzbar"""
+    """Decode QR code from image bytes using qreader"""
     logger.debug(f"Attempting to decode QR code from {len(img_bytes)} bytes")
     
     try:
         # Open image with PIL
         pil_image = Image.open(io.BytesIO(img_bytes))
         
-        # Decode QR codes using pyzbar
-        decoded_objects = pyzbar.decode(pil_image)
+        # Initialize QReader
+        qreader = QReader()
         
-        if decoded_objects:
-            # Return the first QR code found
-            qr_data = decoded_objects[0].data.decode('utf-8')
-            logger.info(f"QR code decoded successfully: {qr_data[:50]}...")  # Log first 50 chars
+        # Decode QR codes
+        decoded_text = qreader.detect_and_decode(image=pil_image)
+        
+        if decoded_text and len(decoded_text) > 0 and decoded_text[0]:
+            qr_data = decoded_text[0]
+            logger.info(f"QR code decoded successfully: {qr_data[:50]}...")
             return qr_data
         else:
             logger.debug("No QR code detected in image")
