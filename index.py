@@ -293,7 +293,7 @@ async def append_image(form_id: int, url: Optional[str], filename: Optional[str]
 
 @app.post("/api/forms")
 @limiter.limit("20/minute")  # 20 form creations per minute
-async def create_form(request: Request, req: Request):
+async def create_form(request: Request):
     """Create a new reconnaissance form
     
     Expected payload:
@@ -307,7 +307,7 @@ async def create_form(request: Request, req: Request):
     logger.info("Creating new reconnaissance form")
     
     try:
-        body = await req.json()
+        body = await request.json()
         logger.debug(f"Form creation request: {body}")
         
         tree = body.get("treeId")
@@ -331,7 +331,7 @@ async def create_form(request: Request, req: Request):
 
 @app.post("/api/image-list")
 @limiter.limit("10/minute")  # 10 image batch uploads per minute
-async def process_blob_images(request: Request, req: Request):
+async def process_blob_images(request: Request):
     """Process a list of images already uploaded to blob storage
     
     Images are downloaded from their blob URLs and processed with timestamp-based form mapping.
@@ -352,7 +352,7 @@ async def process_blob_images(request: Request, req: Request):
     logger.info("Processing blob image list")
     
     try:
-        body = await req.json()
+        body = await request.json()
         images = body.get("images", [])
         
         if not isinstance(images, list) or len(images) == 0:
