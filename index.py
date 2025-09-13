@@ -1,16 +1,21 @@
 # api/index.py
 # FastAPI backend for palm oil reconnaissance forms with image processing
-# Handles QR code detection, blob storage, and PostgreSQL database operations
+# Handles timestamp-based image mapping, blob storage, and PostgreSQL database operations
 
-import os, io, base64, time, hashlib, json, logging
+import os, io, time, hashlib, logging
 from typing import Optional, List, Dict, Any
+from datetime import datetime
+from urllib.parse import urlparse
 from fastapi import FastAPI, Request, HTTPException
-import vercel_blob  # community wrapper; reads BLOB_READ_WRITE_TOKEN env var
 from PIL import Image
-from qreader import QReader
+from PIL.ExifTags import TAGS
 import asyncpg
 import asyncio
+import httpx
 from dotenv import load_dotenv
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,7 +24,17 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 logger.info("Environment variables loaded")
 
+# Initialize rate limiter
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="Palm Oil Reconnaissance API", version="1.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Security configuration
+ALLOWED_BLOB_DOMAINS = [
+    "blob.vercel-storage.com",
+    ".public.blob.vercel-storage.com"  # Allow any subdomain
+]
 
 # --- PostgreSQL connection pool ---
 # Global connection pool for efficient database connections
@@ -82,130 +97,147 @@ def sha256(b: bytes):
     """Calculate SHA256 hash of bytes"""
     return hashlib.sha256(b).hexdigest()
 
-def b64_to_bytes(b64: str) -> bytes:
-    """Convert base64 string to bytes, handling data URLs"""
-    # Remove data URL prefix if present (e.g., "data:image/jpeg;base64,")
-    if b64.startswith("data:") and "," in b64:
-        logger.debug("Removing data URL prefix from base64 string")
-        b64 = b64.split(",",1)[1]
-    return base64.b64decode(b64)
+def validate_blob_url(url: str) -> bool:
+    """Validate that URL is from allowed blob storage domains (SSRF protection)"""
+    try:
+        parsed = urlparse(url)
+        
+        # Must be HTTPS
+        if parsed.scheme != "https":
+            logger.warning(f"Non-HTTPS URL rejected: {url}")
+            return False
+        
+        # Must be from allowed domains
+        hostname = parsed.hostname
+        if not hostname:
+            logger.warning(f"No hostname in URL: {url}")
+            return False
+        
+        # Check against allowed domains
+        for allowed_domain in ALLOWED_BLOB_DOMAINS:
+            if allowed_domain.startswith("."):
+                # Subdomain match (e.g., .public.blob.vercel-storage.com)
+                if hostname.endswith(allowed_domain[1:]):
+                    logger.debug(f"URL validated: {url}")
+                    return True
+            else:
+                # Exact domain match
+                if hostname == allowed_domain:
+                    logger.debug(f"URL validated: {url}")
+                    return True
+        
+        logger.warning(f"URL from disallowed domain rejected: {url}")
+        return False
+        
+    except Exception as e:
+        logger.error(f"URL validation error for {url}: {e}")
+        return False
 
-# QR code detection using pyzbar - returns decoded string or None
-def decode_qr(img_bytes: bytes) -> Optional[str]:
-    """Decode QR code from image bytes using qreader"""
-    logger.debug(f"Attempting to decode QR code from {len(img_bytes)} bytes")
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    """Security middleware for API key authentication and request validation"""
     
+    # Skip security for non-API endpoints
+    if not request.url.path.startswith("/api/"):
+        return await call_next(request)
+    
+    # API Key authentication
+    api_key = request.headers.get("X-API-Key")
+    expected_key = os.environ.get("API_KEY")
+    
+    if not expected_key:
+        logger.error("API_KEY environment variable not set")
+        raise HTTPException(500, "Server configuration error")
+    
+    if api_key != expected_key:
+        logger.warning(f"Invalid API key from {request.client.host}")
+        raise HTTPException(401, "Invalid API key")
+    
+    # No request size limit - allow large batches of images
+    
+    return await call_next(request)
+
+async def download_image_from_url(url: str) -> Optional[bytes]:
+    """Download image from URL and return bytes with security validation"""
+    try:
+        # Validate URL to prevent SSRF
+        if not validate_blob_url(url):
+            logger.warning(f"URL validation failed: {url}")
+            return None
+        
+        logger.debug(f"Downloading image from URL: {url}")
+        
+        # Set timeouts and limits for security
+        timeout = httpx.Timeout(30.0)  # 30 second timeout
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            
+            img_bytes = response.content
+            logger.info(f"Downloaded image: {len(img_bytes)} bytes from {url}")
+            return img_bytes
+            
+    except httpx.TimeoutException:
+        logger.error(f"Timeout downloading image from {url}")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to download image from {url}: {e}")
+        return None
+
+def extract_image_timestamp(img_bytes: bytes) -> Optional[int]:
+    """Extract timestamp from image EXIF data (DateTimeOriginal tag)
+    
+    Returns timestamp in milliseconds or None if not found
+    """
     try:
         # Open image with PIL
         pil_image = Image.open(io.BytesIO(img_bytes))
         
-        # Initialize QReader
-        qreader = QReader()
-        
-        # Decode QR codes
-        decoded_text = qreader.detect_and_decode(image=pil_image)
-        
-        if decoded_text and len(decoded_text) > 0 and decoded_text[0]:
-            qr_data = decoded_text[0]
-            logger.info(f"QR code decoded successfully: {qr_data[:50]}...")
-            return qr_data
-        else:
-            logger.debug("No QR code detected in image")
+        # Get EXIF data
+        exif_data = pil_image.getexif()
+        if not exif_data:
+            logger.debug("No EXIF data found in image")
             return None
-            
-    except Exception as e:
-        logger.error(f"QR decode failed: {e}")
-        return None
-
-def parse_treeid(decoded: str) -> Optional[str]:
-    """Extract tree ID from decoded QR code string
-    
-    Supports multiple formats:
-    - JSON: {"treeId": "123"} or {"id": "123"}
-    - Colon-separated: "tree:123"
-    - Plain string: "123"
-    """
-    if not decoded:
-        logger.debug("No decoded string provided")
-        return None
-    
-    logger.debug(f"Parsing tree ID from: {decoded}")
-    
-    # Try to parse as JSON first
-    try:
-        obj = json.loads(decoded)
-        if isinstance(obj, dict):
-            tree_id = obj.get("treeId") or obj.get("id")
-            if tree_id:
-                logger.info(f"Extracted tree ID from JSON: {tree_id}")
-                return tree_id
-    except Exception as e:
-        logger.debug(f"Not valid JSON: {e}")
-    
-    # Try colon-separated format
-    if ":" in decoded:
-        tree_id = decoded.split(":",1)[1].strip()
-        logger.info(f"Extracted tree ID from colon format: {tree_id}")
-        return tree_id
-    
-    # Use as plain string
-    tree_id = decoded.strip()
-    logger.info(f"Using decoded string as tree ID: {tree_id}")
-    return tree_id
-
-def upload_blob(name: str, payload: bytes) -> Optional[str]:
-    """Upload file to Vercel Blob storage
-    
-    Args:
-        name: File name/path for the blob
-        payload: File content as bytes
         
-    Returns:
-        Public URL of uploaded blob or None if failed
-    """
-    logger.info(f"Uploading blob: {name} ({len(payload)} bytes)")
-    
-    # Ensure BLOB_READ_WRITE_TOKEN is configured
-    if not os.environ.get('BLOB_READ_WRITE_TOKEN'):
-        logger.error("BLOB_READ_WRITE_TOKEN environment variable not set")
-        return None
-    
-    try:
-        resp = vercel_blob.put(name, payload, {"addRandomSuffix": "true", "access": "public"})
+        # Look for DateTimeOriginal tag (tag 36867)
+        for tag_id, value in exif_data.items():
+            tag_name = TAGS.get(tag_id, tag_id)
+            if tag_name == "DateTimeOriginal":
+                logger.debug(f"Found DateTimeOriginal: {value}")
+                
+                # Parse the datetime string (format: "YYYY:MM:DD HH:MM:SS")
+                dt = datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+                timestamp_ms = int(dt.timestamp() * 1000)
+                logger.info(f"Extracted timestamp from EXIF: {timestamp_ms} ({value})")
+                return timestamp_ms
         
-        if isinstance(resp, dict):
-            url = resp.get("url") or resp.get("downloadUrl")
-            if url:
-                logger.info(f"Blob uploaded successfully: {url}")
-                return url
-            else:
-                logger.error(f"No URL in blob response: {resp}")
-                return None
-        else:
-            logger.error(f"Invalid blob response type: {type(resp)}")
-            return None
-            
+        logger.debug("DateTimeOriginal tag not found in EXIF data")
+        return None
+        
     except Exception as e:
-        logger.error(f"Blob upload failed for {name}: {e}")
+        logger.error(f"Failed to extract timestamp from EXIF: {e}")
         return None
 
-async def find_latest_unsynced_form(tree_id: str) -> Optional[int]:
-    """Find the most recent unsynced form for a given tree ID"""
-    logger.debug(f"Looking for latest unsynced form for tree: {tree_id}")
+
+
+async def find_form_by_timestamp(image_timestamp: int) -> Optional[int]:
+    """Find the most recent form created before the given image timestamp"""
+    logger.debug(f"Looking for form created before timestamp: {image_timestamp}")
     
     pool = await get_pool()
     async with pool.acquire() as conn:
         r = await conn.fetchrow(
-            "SELECT id FROM recon_forms WHERE tree_id=$1 AND is_synced=0 ORDER BY created_at DESC LIMIT 1", 
-            tree_id
+            "SELECT id, tree_id FROM recon_forms WHERE created_at <= $1 ORDER BY created_at DESC LIMIT 1", 
+            image_timestamp
         )
         
         if r:
             form_id = r['id']
-            logger.info(f"Found unsynced form {form_id} for tree {tree_id}")
+            tree_id = r['tree_id']
+            logger.info(f"Found form {form_id} (tree: {tree_id}) for timestamp {image_timestamp}")
             return form_id
         else:
-            logger.debug(f"No unsynced forms found for tree {tree_id}")
+            logger.debug(f"No forms found before timestamp {image_timestamp}")
             return None
 
 async def create_placeholder(tree_id: str) -> int:
@@ -260,7 +292,8 @@ async def append_image(form_id: int, url: Optional[str], filename: Optional[str]
 # --- endpoints ---
 
 @app.post("/api/forms")
-async def create_form(req: Request):
+@limiter.limit("20/minute")  # 20 form creations per minute
+async def create_form(request: Request, req: Request):
     """Create a new reconnaissance form
     
     Expected payload:
@@ -294,27 +327,29 @@ async def create_form(req: Request):
             
     except Exception as e:
         logger.error(f"Form creation failed: {e}")
-        raise HTTPException(500, f"Form creation failed: {str(e)}")
+        raise HTTPException(500, "Internal server error")
 
 @app.post("/api/image-list")
-async def image_list(req: Request):
-    """Process a list of images with QR code detection and blob storage
+@limiter.limit("10/minute")  # 10 image batch uploads per minute
+async def process_blob_images(request: Request, req: Request):
+    """Process a list of images already uploaded to blob storage
     
-    Images with QR codes set the current tree context.
-    Subsequent images without QR codes are associated with the current tree.
-    Images without context are stored under 'UNMATCHED' tree.
+    Images are downloaded from their blob URLs and processed with timestamp-based form mapping.
+    Each image is associated with the most recent form created before the image timestamp.
+    If no form exists before the image timestamp, the image is stored as UNMATCHED.
     
     Expected payload:
     {
         "images": [
             {
-                "content": "base64 encoded image data",
-                "filename": "optional filename"
+                "url": "https://blob-url.com/path/to/image.jpg",
+                "filename": "optional filename",
+                "timestamp": optional_fallback_timestamp_ms
             }
         ]
     }
     """
-    logger.info("Processing image list")
+    logger.info("Processing blob image list")
     
     try:
         body = await req.json()
@@ -324,96 +359,90 @@ async def image_list(req: Request):
             logger.error("Invalid images list provided")
             raise HTTPException(400, "images list required")
         
-        logger.info(f"Processing {len(images)} images")
+        # Allow unlimited number of images per request
         
-        # State tracking for current tree/form context
-        current_tree = None
-        current_form = None
+        logger.info(f"Processing {len(images)} blob images")
+        
         processed = 0
         errors: List[Dict[str,Any]] = []
         
         for i, item in enumerate(images):
             try:
-                logger.debug(f"Processing image {i+1}/{len(images)}")
+                logger.debug(f"Processing blob image {i+1}/{len(images)}")
                 
-                b64 = item.get("content")
+                image_url = item.get("url")
                 filename = item.get("filename") or f"image_{i}.jpg"
+                fallback_timestamp = item.get("timestamp", now_ms())
                 
-                if not b64:
-                    logger.warning(f"Image {i} has no content")
-                    errors.append({"index": i, "reason": "no content"})
+                if not image_url:
+                    logger.warning(f"Image {i} has no URL")
+                    errors.append({"index": i, "reason": "no URL provided"})
                     continue
                 
-                # Convert base64 to bytes
-                img_bytes = b64_to_bytes(b64)
-                logger.debug(f"Converted image {i} to {len(img_bytes)} bytes")
+                # Download image from blob storage
+                img_bytes = await download_image_from_url(image_url)
+                if not img_bytes:
+                    logger.error(f"Failed to download image {i} from {image_url}")
+                    errors.append({"index": i, "reason": "failed to download from URL", "url": image_url})
+                    continue
                 
-                # Try to decode QR code
-                decoded = decode_qr(img_bytes)
+                logger.debug(f"Downloaded image {i}: {len(img_bytes)} bytes")
                 
-                if decoded:
-                    # QR code found - extract tree ID and set context
-                    tree_id = parse_treeid(decoded)
-                    if tree_id:
-                        logger.info(f"QR code detected in image {i}: tree {tree_id}")
-                        current_tree = tree_id
-                        
-                        # Find or create form for this tree
-                        fid = await find_latest_unsynced_form(tree_id)
-                        current_form = fid if fid else await create_placeholder(tree_id)
-                        logger.info(f"Set current context: tree={current_tree}, form={current_form}")
-                        continue
-                    else:
-                        logger.warning(f"QR code in image {i} could not be parsed: {decoded}")
-                        errors.append({"index": i, "reason": "qr parsed but no treeId", "decoded": decoded})
-                        continue
+                # Extract timestamp from EXIF data
+                image_timestamp = extract_image_timestamp(img_bytes)
+                if image_timestamp is None:
+                    logger.debug(f"No EXIF timestamp found for image {i}, using fallback: {fallback_timestamp}")
+                    image_timestamp = fallback_timestamp
                 
-                # Non-QR image - upload to current context or UNMATCHED
-                if current_tree is None or current_form is None:
-                    logger.info(f"Image {i} has no tree context, storing as UNMATCHED")
+                logger.info(f"Blob image {i} timestamp: {image_timestamp}")
+                
+                # Find form based on timestamp
+                form_id = await find_form_by_timestamp(image_timestamp)
+                
+                if not form_id:
+                    logger.info(f"Blob image {i} has no matching form (timestamp: {image_timestamp}), marking as UNMATCHED")
                     
-                    # Upload to unmatched folder
-                    name = f"unmatched/{int(time.time()*1000)}_{i}.jpg"
-                    url = upload_blob(name, img_bytes)
+                    # Find or create UNMATCHED form
+                    unmatched_form = await find_form_by_timestamp(now_ms())
+                    if not unmatched_form:
+                        unmatched_form = await create_placeholder("UNMATCHED")
+                    
                     checksum = sha256(img_bytes)
-                    
-                    # Ensure UNMATCHED placeholder form exists
-                    fid = await find_latest_unsynced_form("UNMATCHED")
-                    if not fid:
-                        fid = await create_placeholder("UNMATCHED")
-                    
-                    await append_image(fid, url, filename, checksum)
-                    errors.append({"index": i, "reason": "no current tree; stored under UNMATCHED", "url": url})
+                    await append_image(unmatched_form, image_url, filename, checksum)
+                    errors.append({
+                        "index": i, 
+                        "reason": "no form found for timestamp; stored under UNMATCHED", 
+                        "url": image_url, 
+                        "timestamp": image_timestamp
+                    })
                     processed += 1
                     continue
                 
-                # Upload image to current tree/form context
-                logger.info(f"Uploading image {i} to tree {current_tree}, form {current_form}")
-                name = f"{current_tree}/{current_form}/{int(time.time()*1000)}_{i}.jpg"
-                url = upload_blob(name, img_bytes)
+                # Get form details
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    form_data = await conn.fetchrow("SELECT tree_id FROM recon_forms WHERE id=$1", form_id)
+                    tree_id = form_data['tree_id'] if form_data else 'UNKNOWN'
                 
-                if not url:
-                    logger.error(f"Failed to upload image {i} to blob storage")
-                    errors.append({"index": i, "reason": "blob upload failed"})
-                    continue
+                logger.info(f"Mapping blob image {i} to form {form_id} (tree: {tree_id})")
                 
                 checksum = sha256(img_bytes)
-                ok = await append_image(current_form, url, filename, checksum)
+                ok = await append_image(form_id, image_url, filename, checksum)
                 
                 if ok:
                     processed += 1
-                    logger.info(f"Successfully processed image {i}: {url}")
+                    logger.info(f"Successfully processed blob image {i}: {image_url} -> form {form_id}")
                 else:
-                    logger.warning(f"Duplicate image detected at index {i}")
+                    logger.warning(f"Duplicate blob image detected at index {i}")
                     errors.append({"index": i, "reason": "duplicate checksum; skipped"})
                     
             except Exception as e:
-                logger.error(f"Error processing image {i}: {e}")
+                logger.error(f"Error processing blob image {i}: {e}")
                 errors.append({"index": i, "error": str(e)})
         
-        logger.info(f"Image processing complete: {processed} processed, {len(errors)} errors")
+        logger.info(f"Blob image processing complete: {processed} processed, {len(errors)} errors")
         return {"processed": processed, "errors": errors}
         
     except Exception as e:
-        logger.error(f"Image list processing failed: {e}")
-        raise HTTPException(500, f"Image processing failed: {str(e)}")
+        logger.error(f"Blob image list processing failed: {e}")
+        raise HTTPException(500, "Internal server error")
