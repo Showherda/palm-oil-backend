@@ -6,4 +6,4 @@ pillow
 httpx
 slowapi
 pydantic
-python-magic-bin
+python-magic
