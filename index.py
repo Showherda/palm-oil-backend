@@ -654,17 +654,17 @@ async def create_recon_form(request: Request, form_data: ReconFormRequest):
         logger.error(f"Form creation failed: {e}")
         raise HTTPException(500, f"Internal server error: {str(e)}")
 
-@app.get("/api/forms/{tree_id}")
+@app.get("/api/forms/{plot_id}")
 @limiter.limit("100/minute")
-async def get_forms_by_tree(
-    tree_id: str,
+async def get_forms_by_plot(
+    plot_id: str,
     request: Request,
     include_images: bool = Query(False),
     limit: int = Query(100, le=1000),
     offset: int = Query(0, ge=0)
 ):
-    """Get all forms for a specific tree with optional images"""
-    logger.info(f"Retrieving forms for tree: {tree_id}")
+    """Get all forms for a specific plot with optional images"""
+    logger.info(f"Retrieving forms for plot: {plot_id}")
 
     try:
         pool = await get_pool()
@@ -686,23 +686,23 @@ async def get_forms_by_tree(
                            ) as images
                     FROM recon_forms f
                     LEFT JOIN images i ON f.id = i.form_id AND i.form_type = 'recon'
-                    WHERE f.tree_id = $1
+                    WHERE f.plot_id = $1
                     GROUP BY f.id
                     ORDER BY f.created_at DESC
                     LIMIT $2 OFFSET $3
                 """
-                rows = await conn.fetch(query, tree_id, limit, offset)
+                rows = await conn.fetch(query, plot_id, limit, offset)
             else:
                 query = """
                     SELECT * FROM recon_forms
-                    WHERE tree_id = $1
+                    WHERE plot_id = $1
                     ORDER BY created_at DESC
                     LIMIT $2 OFFSET $3
                 """
-                rows = await conn.fetch(query, tree_id, limit, offset)
+                rows = await conn.fetch(query, plot_id, limit, offset)
 
             # Get total count
-            total = await conn.fetchval("SELECT COUNT(*) FROM recon_forms WHERE tree_id = $1", tree_id)
+            total = await conn.fetchval("SELECT COUNT(*) FROM recon_forms WHERE plot_id = $1", plot_id)
 
             forms = [dict(row) for row in rows]
             return {
@@ -712,7 +712,7 @@ async def get_forms_by_tree(
             }
 
     except Exception as e:
-        logger.error(f"Failed to retrieve forms for tree {tree_id}: {e}")
+        logger.error(f"Failed to retrieve forms for plot {plot_id}: {e}")
         raise HTTPException(500, "Internal server error")
 
 @app.post("/api/harvester-proofs")
