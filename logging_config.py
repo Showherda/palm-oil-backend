@@ -6,6 +6,7 @@ Provides structured logging with rotation, JSON formatting, and contextual infor
 import logging
 import logging.handlers
 import sys
+import os
 import json
 from datetime import datetime
 from pathlib import Path
@@ -82,9 +83,23 @@ def setup_logging(
         Configured logger instance
     """
 
-    # Create log directory if it doesn't exist
-    log_path = Path(log_dir)
-    log_path.mkdir(exist_ok=True)
+    # Detect serverless environment (Vercel, AWS Lambda, etc.)
+    is_serverless = os.environ.get('VERCEL') or os.environ.get('AWS_LAMBDA_FUNCTION_NAME')
+
+    # Disable file logging in serverless environments (filesystem is ephemeral/read-only)
+    if is_serverless:
+        enable_file = False
+
+    # Try to create log directory if file logging is enabled
+    log_path = None
+    if enable_file:
+        try:
+            log_path = Path(log_dir)
+            log_path.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            # If we can't create log directory, disable file logging and continue with console only
+            print(f"Warning: Could not create log directory '{log_dir}': {e}. Disabling file logging.")
+            enable_file = False
 
     # Get root logger
     logger = logging.getLogger()
@@ -102,15 +117,15 @@ def setup_logging(
             datefmt="%Y-%m-%d %H:%M:%S"
         )
 
-    # Console handler
+    # Console handler (always enabled in serverless)
     if enable_console:
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(logging.INFO)
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
 
-    # File handlers with rotation
-    if enable_file:
+    # File handlers with rotation (only if enabled and directory exists)
+    if enable_file and log_path:
         # Main application log
         app_handler = logging.handlers.RotatingFileHandler(
             log_path / "app.log",
