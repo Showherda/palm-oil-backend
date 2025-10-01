@@ -172,31 +172,50 @@ ALLOWED_BLOB_DOMAINS = [
 
 # --- PostgreSQL connection pool ---
 # Global connection pool for efficient database connections
+# In serverless environments, we need to track the event loop and recreate pool if it changes
 _pool = None
+_pool_loop = None
 
 async def get_pool():
-    """Get or create PostgreSQL connection pool"""
-    global _pool
-    if _pool is None:
+    """Get or create PostgreSQL connection pool (event-loop aware for serverless)"""
+    global _pool, _pool_loop
+
+    # Get current event loop
+    current_loop = asyncio.get_event_loop()
+
+    # Check if pool exists and is tied to the current event loop
+    # If not, close old pool and create new one
+    if _pool is None or _pool_loop != current_loop:
+        # Close existing pool if it exists and is from a different loop
+        if _pool is not None:
+            try:
+                db_logger.info("Closing old connection pool (event loop changed)")
+                await _pool.close()
+            except Exception as e:
+                db_logger.warning(f"Error closing old pool: {e}")
+
         postgres_url = os.environ.get('POSTGRES_URL')
         if not postgres_url:
             db_logger.error("POSTGRES_URL environment variable not set")
             raise ValueError("Database URL not configured")
 
-        db_logger.info("Creating PostgreSQL connection pool")
+        db_logger.info("Creating PostgreSQL connection pool", extra={"event_loop_id": id(current_loop)})
         try:
             _pool = await asyncpg.create_pool(
                 postgres_url,
                 min_size=1,
-                max_size=10
+                max_size=10,
+                command_timeout=60
             )
+            _pool_loop = current_loop
             db_logger.info(
                 "PostgreSQL connection pool created successfully",
-                extra={"min_size": 1, "max_size": 10}
+                extra={"min_size": 1, "max_size": 10, "event_loop_id": id(current_loop)}
             )
         except Exception as e:
             db_logger.error(f"Failed to create connection pool: {e}", exc_info=True)
             raise
+
     return _pool
 
 async def init_db():
@@ -328,6 +347,18 @@ async def startup():
     logger.info("Starting up FastAPI application")
     await init_db()
     logger.info("Application startup completed")
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Application shutdown event handler - cleanup resources"""
+    global _pool
+    if _pool is not None:
+        try:
+            logger.info("Closing database connection pool")
+            await _pool.close()
+            logger.info("Database connection pool closed")
+        except Exception as e:
+            logger.error(f"Error closing connection pool: {e}", exc_info=True)
 
 # --- Helper functions ---
 def now_ms(): 
