@@ -234,6 +234,21 @@ async def init_db():
 
     try:
         async with pool.acquire() as conn:
+            # Plots table (must be created first for foreign key references)
+            db_logger.debug("Creating plots table")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS plots (
+                    id VARCHAR(10) PRIMARY KEY
+                )
+            """)
+
+            # Insert initial plot IDs (A-J) if table is empty
+            existing_plots = await conn.fetchval("SELECT COUNT(*) FROM plots")
+            if existing_plots == 0:
+                db_logger.debug("Inserting initial plot IDs (A-J)")
+                for letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']:
+                    await conn.execute("INSERT INTO plots (id) VALUES ($1)", letter)
+
             # Enhanced recon_forms table
             db_logger.debug("Creating enhanced recon_forms table")
             await conn.execute("""
@@ -251,7 +266,8 @@ async def init_db():
                     version INTEGER DEFAULT 1,
                     created_by VARCHAR(100),
                     updated_by VARCHAR(100),
-                    placeholder INTEGER DEFAULT 0
+                    placeholder INTEGER DEFAULT 0,
+                    CONSTRAINT fk_recon_forms_plot_id FOREIGN KEY (plot_id) REFERENCES plots(id)
                 )
             """)
 
@@ -296,7 +312,8 @@ async def init_db():
                     notes TEXT,
                     harvester_id VARCHAR(100),
                     client_id TEXT,
-                    version INTEGER DEFAULT 1
+                    version INTEGER DEFAULT 1,
+                    CONSTRAINT fk_harvester_proofs_plot_id FOREIGN KEY (plot_id) REFERENCES plots(id)
                 )
             """)
 
@@ -320,7 +337,8 @@ async def init_db():
                     surveyor_id VARCHAR(100),
                     client_id TEXT,
                     version INTEGER DEFAULT 1,
-                    UNIQUE (plot_id, tree_id)
+                    UNIQUE (plot_id, tree_id),
+                    CONSTRAINT fk_tree_locations_plot_id FOREIGN KEY (plot_id) REFERENCES plots(id)
                 )
             """)
 
@@ -757,6 +775,7 @@ async def root():
         "version": "2.0.0",
         "status": "operational",
         "endpoints": {
+            "plots": "/api/plots",
             "forms": "/api/forms",
             "images": "/api/image-list",
             "harvester_proofs": "/api/harvester-proofs",
@@ -783,6 +802,26 @@ async def health_check():
         raise HTTPException(503, "Service unavailable")
 
 # --- Data Collection Endpoints ---
+
+@app.get("/api/plots")
+@limiter.limit("100/minute")
+async def get_plots(request: Request):
+    """Get all plots"""
+    logger.info("Retrieving all plots")
+
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id FROM plots ORDER BY id ASC")
+
+            plots = [{"id": row["id"]} for row in rows]
+
+            logger.info(f"Retrieved plots", extra={"count": len(plots)})
+            return {"plots": plots, "total": len(plots)}
+
+    except Exception as e:
+        logger.error(f"Failed to retrieve plots", extra={"error": str(e)}, exc_info=True)
+        raise HTTPException(500, "Internal server error")
 
 @app.post("/api/forms")
 @limiter.limit("20/minute")
