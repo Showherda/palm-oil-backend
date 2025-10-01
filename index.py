@@ -175,10 +175,11 @@ ALLOWED_BLOB_DOMAINS = [
 # In serverless environments, we need to track the event loop and recreate pool if it changes
 _pool = None
 _pool_loop = None
+_db_initialized = False
 
 async def get_pool():
     """Get or create PostgreSQL connection pool (event-loop aware for serverless)"""
-    global _pool, _pool_loop
+    global _pool, _pool_loop, _db_initialized
 
     # Get current event loop
     current_loop = asyncio.get_event_loop()
@@ -212,6 +213,14 @@ async def get_pool():
                 "PostgreSQL connection pool created successfully",
                 extra={"min_size": 1, "max_size": 10, "event_loop_id": id(current_loop)}
             )
+
+            # Initialize database tables on first pool creation (serverless workaround)
+            # The @app.on_event("startup") doesn't reliably fire in serverless
+            if not _db_initialized:
+                db_logger.info("Ensuring database tables are initialized")
+                await init_db()
+                _db_initialized = True
+
         except Exception as e:
             db_logger.error(f"Failed to create connection pool: {e}", exc_info=True)
             raise
