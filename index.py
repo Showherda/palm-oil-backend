@@ -3,7 +3,7 @@
 # Comprehensive data collection with recon forms, harvester proofs, and tree locations
 # Enhanced security, validation, and database operations
 
-import os, io, time, hashlib, logging, re
+import os, io, time, hashlib, re
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from urllib.parse import urlparse
@@ -23,12 +23,29 @@ try:
 except ImportError:
     magic = None
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Import centralized logging configuration
+from logging_config import setup_logging, get_logger, get_access_logger, get_db_logger
 
 load_dotenv()
-logger.info("Environment variables loaded")
+
+# Initialize comprehensive logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+ENABLE_JSON_LOGS = os.getenv("ENABLE_JSON_LOGS", "true").lower() == "true"
+LOG_DIR = os.getenv("LOG_DIR", "logs")
+
+setup_logging(
+    log_level=LOG_LEVEL,
+    log_dir=LOG_DIR,
+    enable_json=ENABLE_JSON_LOGS,
+    enable_console=True,
+    enable_file=True
+)
+
+logger = get_logger(__name__)
+access_logger = get_access_logger()
+db_logger = get_db_logger()
+
+logger.info("Environment variables loaded", extra={"log_level": LOG_LEVEL, "json_logs": ENABLE_JSON_LOGS})
 
 # Pydantic models for request validation
 class ReconFormRequest(BaseModel):
@@ -163,135 +180,147 @@ async def get_pool():
     if _pool is None:
         postgres_url = os.environ.get('POSTGRES_URL')
         if not postgres_url:
-            logger.error("POSTGRES_URL environment variable not set")
+            db_logger.error("POSTGRES_URL environment variable not set")
             raise ValueError("Database URL not configured")
-        
-        logger.info("Creating PostgreSQL connection pool")
-        _pool = await asyncpg.create_pool(
-            postgres_url,
-            min_size=1,
-            max_size=10
-        )
-        logger.info("PostgreSQL connection pool created successfully")
+
+        db_logger.info("Creating PostgreSQL connection pool")
+        try:
+            _pool = await asyncpg.create_pool(
+                postgres_url,
+                min_size=1,
+                max_size=10
+            )
+            db_logger.info(
+                "PostgreSQL connection pool created successfully",
+                extra={"min_size": 1, "max_size": 10}
+            )
+        except Exception as e:
+            db_logger.error(f"Failed to create connection pool: {e}", exc_info=True)
+            raise
     return _pool
 
 async def init_db():
     """Initialize database tables if they don't exist"""
-    logger.info("Initializing comprehensive database tables")
+    db_logger.info("Initializing comprehensive database tables")
     pool = await get_pool()
-    async with pool.acquire() as conn:
 
-        # Enhanced recon_forms table
-        logger.info("Creating enhanced recon_forms table")
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS recon_forms (
-                id SERIAL PRIMARY KEY,
-                tree_id VARCHAR(50) NOT NULL,
-                plot_id VARCHAR(50),
-                number_of_fruits INTEGER CHECK (number_of_fruits > 0),
-                harvest_days INTEGER CHECK (harvest_days IN (1, 2, 3)),
-                created_at BIGINT NOT NULL,
-                updated_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()) * 1000,
-                is_synced BOOLEAN DEFAULT false,
-                sync_timestamp BIGINT,
-                client_id TEXT,
-                version INTEGER DEFAULT 1,
-                created_by VARCHAR(100),
-                updated_by VARCHAR(100),
-                placeholder INTEGER DEFAULT 0
-            )
-        """)
+    try:
+        async with pool.acquire() as conn:
+            # Enhanced recon_forms table
+            db_logger.debug("Creating enhanced recon_forms table")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS recon_forms (
+                    id SERIAL PRIMARY KEY,
+                    tree_id VARCHAR(50) NOT NULL,
+                    plot_id VARCHAR(50),
+                    number_of_fruits INTEGER CHECK (number_of_fruits > 0),
+                    harvest_days INTEGER CHECK (harvest_days IN (1, 2, 3)),
+                    created_at BIGINT NOT NULL,
+                    updated_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()) * 1000,
+                    is_synced BOOLEAN DEFAULT false,
+                    sync_timestamp BIGINT,
+                    client_id TEXT,
+                    version INTEGER DEFAULT 1,
+                    created_by VARCHAR(100),
+                    updated_by VARCHAR(100),
+                    placeholder INTEGER DEFAULT 0
+                )
+            """)
 
-        # Enhanced images table
-        logger.info("Creating enhanced images table")
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS images (
-                id SERIAL PRIMARY KEY,
-                form_id INTEGER NOT NULL,
-                form_type VARCHAR(20) NOT NULL DEFAULT 'recon',
-                url TEXT,
-                filename VARCHAR(255),
-                original_filename VARCHAR(255),
-                checksum VARCHAR(64) NOT NULL,
-                file_size BIGINT,
-                mime_type VARCHAR(50),
-                image_width INTEGER,
-                image_height INTEGER,
-                exif_data JSONB,
-                uploaded_at BIGINT NOT NULL,
-                image_index INTEGER CHECK (image_index BETWEEN 1 AND 3),
-                processing_status VARCHAR(20) DEFAULT 'pending'
-            )
-        """)
+            # Enhanced images table
+            db_logger.debug("Creating enhanced images table")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS images (
+                    id SERIAL PRIMARY KEY,
+                    form_id INTEGER NOT NULL,
+                    form_type VARCHAR(20) NOT NULL DEFAULT 'recon',
+                    url TEXT,
+                    filename VARCHAR(255),
+                    original_filename VARCHAR(255),
+                    checksum VARCHAR(64) NOT NULL,
+                    file_size BIGINT,
+                    mime_type VARCHAR(50),
+                    image_width INTEGER,
+                    image_height INTEGER,
+                    exif_data JSONB,
+                    uploaded_at BIGINT NOT NULL,
+                    image_index INTEGER CHECK (image_index BETWEEN 1 AND 3),
+                    processing_status VARCHAR(20) DEFAULT 'pending'
+                )
+            """)
 
-        # Harvester proofs table
-        logger.info("Creating harvester_proofs table")
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS harvester_proofs (
-                id SERIAL PRIMARY KEY,
-                tree_id VARCHAR(50) NOT NULL,
-                plot_id VARCHAR(50) NOT NULL,
-                image_url TEXT,
-                local_image_path TEXT,
-                created_at BIGINT NOT NULL,
-                updated_at BIGINT NOT NULL,
-                is_synced BOOLEAN DEFAULT false,
-                sync_timestamp BIGINT,
-                location_latitude DECIMAL(10, 8),
-                location_longitude DECIMAL(11, 8),
-                location_accuracy DECIMAL(6, 2),
-                notes TEXT,
-                harvester_id VARCHAR(100),
-                client_id TEXT,
-                version INTEGER DEFAULT 1
-            )
-        """)
+            # Harvester proofs table
+            db_logger.debug("Creating harvester_proofs table")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS harvester_proofs (
+                    id SERIAL PRIMARY KEY,
+                    tree_id VARCHAR(50) NOT NULL,
+                    plot_id VARCHAR(50) NOT NULL,
+                    image_url TEXT,
+                    local_image_path TEXT,
+                    created_at BIGINT NOT NULL,
+                    updated_at BIGINT NOT NULL,
+                    is_synced BOOLEAN DEFAULT false,
+                    sync_timestamp BIGINT,
+                    location_latitude DECIMAL(10, 8),
+                    location_longitude DECIMAL(11, 8),
+                    location_accuracy DECIMAL(6, 2),
+                    notes TEXT,
+                    harvester_id VARCHAR(100),
+                    client_id TEXT,
+                    version INTEGER DEFAULT 1
+                )
+            """)
 
-        # Tree locations table
-        logger.info("Creating tree_locations table")
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS tree_locations (
-                id SERIAL PRIMARY KEY,
-                tree_id VARCHAR(50) NOT NULL,
-                plot_id VARCHAR(50) NOT NULL,
-                x_coordinate DECIMAL(10, 6) NOT NULL,
-                y_coordinate DECIMAL(10, 6) NOT NULL,
-                latitude DECIMAL(10, 8),
-                longitude DECIMAL(11, 8),
-                gps_accuracy DECIMAL(6, 2),
-                created_at BIGINT NOT NULL,
-                updated_at BIGINT NOT NULL,
-                is_synced BOOLEAN DEFAULT false,
-                sync_timestamp BIGINT,
-                notes TEXT,
-                surveyor_id VARCHAR(100),
-                client_id TEXT,
-                version INTEGER DEFAULT 1,
-                UNIQUE (plot_id, tree_id)
-            )
-        """)
+            # Tree locations table
+            db_logger.debug("Creating tree_locations table")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS tree_locations (
+                    id SERIAL PRIMARY KEY,
+                    tree_id VARCHAR(50) NOT NULL,
+                    plot_id VARCHAR(50) NOT NULL,
+                    x_coordinate DECIMAL(10, 6) NOT NULL,
+                    y_coordinate DECIMAL(10, 6) NOT NULL,
+                    latitude DECIMAL(10, 8),
+                    longitude DECIMAL(11, 8),
+                    gps_accuracy DECIMAL(6, 2),
+                    created_at BIGINT NOT NULL,
+                    updated_at BIGINT NOT NULL,
+                    is_synced BOOLEAN DEFAULT false,
+                    sync_timestamp BIGINT,
+                    notes TEXT,
+                    surveyor_id VARCHAR(100),
+                    client_id TEXT,
+                    version INTEGER DEFAULT 1,
+                    UNIQUE (plot_id, tree_id)
+                )
+            """)
 
-        # Create indexes for performance
-        logger.info("Creating database indexes")
+            # Create indexes for performance
+            db_logger.debug("Creating database indexes")
 
-        # Recon forms indexes
-        await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_recon_forms_tree_id ON recon_forms(tree_id)")
-        await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_recon_forms_plot_id ON recon_forms(plot_id)")
-        await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_recon_forms_created_at ON recon_forms(created_at)")
+            # Recon forms indexes
+            await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_recon_forms_tree_id ON recon_forms(tree_id)")
+            await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_recon_forms_plot_id ON recon_forms(plot_id)")
+            await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_recon_forms_created_at ON recon_forms(created_at)")
 
-        # Images indexes
-        await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_images_form_id ON images(form_id)")
-        await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_images_checksum ON images(checksum)")
+            # Images indexes
+            await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_images_form_id ON images(form_id)")
+            await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_images_checksum ON images(checksum)")
 
-        # Harvester proofs indexes
-        await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvester_proofs_tree_id ON harvester_proofs(tree_id)")
-        await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvester_proofs_plot_id ON harvester_proofs(plot_id)")
+            # Harvester proofs indexes
+            await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvester_proofs_tree_id ON harvester_proofs(tree_id)")
+            await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvester_proofs_plot_id ON harvester_proofs(plot_id)")
 
-        # Tree locations indexes
-        await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tree_locations_tree_id ON tree_locations(tree_id)")
-        await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tree_locations_plot_id ON tree_locations(plot_id)")
+            # Tree locations indexes
+            await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tree_locations_tree_id ON tree_locations(tree_id)")
+            await conn.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tree_locations_plot_id ON tree_locations(plot_id)")
 
-        logger.info("Database tables and indexes initialized successfully")
+            db_logger.info("Database tables and indexes initialized successfully")
+
+    except Exception as e:
+        db_logger.error(f"Database initialization failed: {e}", exc_info=True)
+        raise
 
 @app.on_event("startup")
 async def startup():
@@ -424,28 +453,103 @@ def extract_image_metadata(img_bytes: bytes) -> Dict[str, Any]:
         return {}
 
 @app.middleware("http")
-async def security_middleware(request: Request, call_next):
-    """Security middleware for API key authentication and request validation"""
-    
+async def logging_and_security_middleware(request: Request, call_next):
+    """Combined logging and security middleware for request/response tracking"""
+
+    # Generate unique request ID for tracing
+    request_id = hashlib.md5(f"{time.time()}{request.client.host}{request.url.path}".encode()).hexdigest()[:12]
+
+    # Record start time for performance tracking
+    start_time = time.time()
+
+    # Log incoming request
+    access_logger.info(
+        f"Incoming request: {request.method} {request.url.path}",
+        extra={
+            "request_id": request_id,
+            "method": request.method,
+            "endpoint": request.url.path,
+            "client_ip": request.client.host,
+            "user_agent": request.headers.get("user-agent", "unknown"),
+            "query_params": str(request.query_params)
+        }
+    )
+
     # Skip security for non-API endpoints
     if not request.url.path.startswith("/api/"):
-        return await call_next(request)
-    
+        response = await call_next(request)
+        duration_ms = (time.time() - start_time) * 1000
+
+        access_logger.info(
+            f"Request completed: {request.method} {request.url.path}",
+            extra={
+                "request_id": request_id,
+                "status_code": response.status_code,
+                "duration_ms": round(duration_ms, 2)
+            }
+        )
+        return response
+
     # API Key authentication
     api_key = request.headers.get("X-API-Key")
     expected_key = os.environ.get("API_KEY")
-    
+
     if not expected_key:
-        logger.error("API_KEY environment variable not set")
+        logger.error("API_KEY environment variable not set", extra={"request_id": request_id})
         raise HTTPException(500, "Server configuration error")
-    
+
     if api_key != expected_key:
-        logger.warning(f"Invalid API key from {request.client.host}")
+        logger.warning(
+            f"Invalid API key attempt from {request.client.host}",
+            extra={
+                "request_id": request_id,
+                "client_ip": request.client.host,
+                "endpoint": request.url.path
+            }
+        )
         raise HTTPException(401, "Invalid API key")
-    
-    # No request size limit - allow large batches of images
-    
-    return await call_next(request)
+
+    # Process request
+    try:
+        response = await call_next(request)
+        duration_ms = (time.time() - start_time) * 1000
+
+        # Log successful response
+        access_logger.info(
+            f"Request completed: {request.method} {request.url.path}",
+            extra={
+                "request_id": request_id,
+                "status_code": response.status_code,
+                "duration_ms": round(duration_ms, 2),
+                "endpoint": request.url.path
+            }
+        )
+
+        # Log performance warning for slow requests
+        if duration_ms > 5000:  # > 5 seconds
+            logger.warning(
+                f"Slow request detected: {request.method} {request.url.path}",
+                extra={
+                    "request_id": request_id,
+                    "duration_ms": round(duration_ms, 2),
+                    "endpoint": request.url.path
+                }
+            )
+
+        return response
+
+    except Exception as e:
+        duration_ms = (time.time() - start_time) * 1000
+        logger.error(
+            f"Request failed: {request.method} {request.url.path} - {str(e)}",
+            extra={
+                "request_id": request_id,
+                "duration_ms": round(duration_ms, 2),
+                "error": str(e)
+            },
+            exc_info=True
+        )
+        raise
 
 async def download_image_from_url(url: str) -> Optional[bytes]:
     """Download image from URL and return bytes with security validation"""
@@ -512,71 +616,95 @@ def extract_image_timestamp(img_bytes: bytes) -> Optional[int]:
 
 async def find_form_by_timestamp(image_timestamp: int) -> Optional[int]:
     """Find the most recent form created before the given image timestamp"""
-    logger.debug(f"Looking for form created before timestamp: {image_timestamp}")
-    
+    db_logger.debug(
+        f"Searching for form by timestamp",
+        extra={"image_timestamp": image_timestamp}
+    )
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         r = await conn.fetchrow(
-            "SELECT id, tree_id FROM recon_forms WHERE created_at <= $1 ORDER BY created_at DESC LIMIT 1", 
+            "SELECT id, tree_id FROM recon_forms WHERE created_at <= $1 ORDER BY created_at DESC LIMIT 1",
             image_timestamp
         )
-        
+
         if r:
             form_id = r['id']
             tree_id = r['tree_id']
-            logger.info(f"Found form {form_id} (tree: {tree_id}) for timestamp {image_timestamp}")
+            db_logger.info(
+                f"Form found by timestamp",
+                extra={"form_id": form_id, "tree_id": tree_id, "image_timestamp": image_timestamp}
+            )
             return form_id
         else:
-            logger.debug(f"No forms found before timestamp {image_timestamp}")
+            db_logger.debug(
+                f"No form found before timestamp",
+                extra={"image_timestamp": image_timestamp}
+            )
             return None
 
 async def create_placeholder(tree_id: str) -> int:
     """Create a placeholder form for a tree ID to collect images"""
-    logger.info(f"Creating placeholder form for tree: {tree_id}")
-    
+    db_logger.info(
+        f"Creating placeholder form",
+        extra={"tree_id": tree_id}
+    )
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         form_id = await conn.fetchval(
-            "INSERT INTO recon_forms(tree_id, created_at, placeholder) VALUES ($1, $2, 1) RETURNING id", 
+            "INSERT INTO recon_forms(tree_id, created_at, placeholder) VALUES ($1, $2, 1) RETURNING id",
             tree_id, now_ms()
         )
-        
-        logger.info(f"Created placeholder form {form_id} for tree {tree_id}")
+
+        db_logger.info(
+            f"Placeholder form created",
+            extra={"form_id": form_id, "tree_id": tree_id}
+        )
         return form_id
 
 async def append_image(form_id: int, url: Optional[str], filename: Optional[str], checksum: str) -> bool:
     """Add image metadata to a form
-    
+
     Args:
         form_id: Form to attach image to
         url: Public URL of uploaded image
         filename: Original filename
         checksum: SHA256 hash for duplicate detection
-        
+
     Returns:
         True if image was added, False if duplicate detected
     """
-    logger.debug(f"Adding image to form {form_id}: {filename} (checksum: {checksum[:16]}...)")
-    
+    db_logger.debug(
+        f"Adding image to form",
+        extra={"form_id": form_id, "filename": filename, "checksum": checksum[:16]}
+    )
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         # Check for duplicates based on form_id and checksum
         existing = await conn.fetchrow(
-            "SELECT id FROM images WHERE form_id=$1 AND checksum=$2", 
+            "SELECT id FROM images WHERE form_id=$1 AND checksum=$2",
             form_id, checksum
         )
-        
+
         if existing:
-            logger.warning(f"Duplicate image detected for form {form_id}, checksum: {checksum[:16]}...")
+            db_logger.warning(
+                f"Duplicate image detected",
+                extra={"form_id": form_id, "checksum": checksum[:16], "existing_id": existing['id']}
+            )
             return False
-        
+
         # Insert new image record
         await conn.execute(
             "INSERT INTO images(form_id,url,filename,checksum,uploaded_at) VALUES ($1,$2,$3,$4,$5)",
             form_id, url, filename, checksum, now_ms()
         )
-        
-        logger.info(f"Image added successfully to form {form_id}: {filename}")
+
+        db_logger.info(
+            f"Image added to form",
+            extra={"form_id": form_id, "filename": filename}
+        )
         return True
 
 # --- Health and Info Endpoints ---
@@ -620,7 +748,16 @@ async def health_check():
 @limiter.limit("20/minute")
 async def create_recon_form(request: Request, form_data: ReconFormRequest):
     """Create a new reconnaissance form with enhanced validation"""
-    logger.info(f"Creating reconnaissance form for tree: {form_data.treeId}")
+    logger.info(
+        f"Creating reconnaissance form",
+        extra={
+            "tree_id": form_data.treeId,
+            "plot_id": form_data.plotId,
+            "number_of_fruits": form_data.numberOfFruits,
+            "harvest_days": form_data.harvestDays,
+            "client_id": form_data.clientId
+        }
+    )
 
     try:
         pool = await get_pool()
@@ -634,7 +771,10 @@ async def create_recon_form(request: Request, form_data: ReconFormRequest):
             """, form_data.treeId, form_data.plotId, now_ms() - 30*60*1000)
 
             if existing_form:
-                logger.warning(f"Duplicate form detected for tree {form_data.treeId}")
+                logger.warning(
+                    f"Duplicate form detected",
+                    extra={"tree_id": form_data.treeId, "plot_id": form_data.plotId, "existing_form_id": existing_form['id']}
+                )
                 raise HTTPException(409, "Duplicate form detected within 30 minutes")
 
             form_id = await conn.fetchval("""
@@ -645,13 +785,20 @@ async def create_recon_form(request: Request, form_data: ReconFormRequest):
             """, form_data.treeId, form_data.plotId, form_data.numberOfFruits,
                 form_data.harvestDays, now_ms(), form_data.clientId)
 
-            logger.info(f"Form created successfully: {form_id} for tree {form_data.treeId}")
+            logger.info(
+                f"Recon form created successfully",
+                extra={"form_id": form_id, "tree_id": form_data.treeId, "plot_id": form_data.plotId}
+            )
             return {"formId": form_id, "status": "success", "timestamp": now_ms()}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Form creation failed: {e}")
+        logger.error(
+            f"Form creation failed",
+            extra={"tree_id": form_data.treeId, "error": str(e)},
+            exc_info=True
+        )
         raise HTTPException(500, f"Internal server error: {str(e)}")
 
 @app.get("/api/forms/{plot_id}")
@@ -664,7 +811,10 @@ async def get_forms_by_plot(
     offset: int = Query(0, ge=0)
 ):
     """Get all forms for a specific plot with optional images"""
-    logger.info(f"Retrieving forms for plot: {plot_id}")
+    logger.info(
+        f"Retrieving forms for plot",
+        extra={"plot_id": plot_id, "include_images": include_images, "limit": limit, "offset": offset}
+    )
 
     try:
         pool = await get_pool()
@@ -705,6 +855,10 @@ async def get_forms_by_plot(
             total = await conn.fetchval("SELECT COUNT(*) FROM recon_forms WHERE plot_id = $1", plot_id)
 
             forms = [dict(row) for row in rows]
+            logger.info(
+                f"Forms retrieved successfully",
+                extra={"plot_id": plot_id, "count": len(forms), "total": total}
+            )
             return {
                 "forms": forms,
                 "total": total,
@@ -712,14 +866,26 @@ async def get_forms_by_plot(
             }
 
     except Exception as e:
-        logger.error(f"Failed to retrieve forms for plot {plot_id}: {e}")
+        logger.error(
+            f"Failed to retrieve forms for plot",
+            extra={"plot_id": plot_id, "error": str(e)},
+            exc_info=True
+        )
         raise HTTPException(500, "Internal server error")
 
 @app.post("/api/harvester-proofs")
 @limiter.limit("50/minute")
 async def create_harvester_proof(request: Request, proof_data: HarvesterProofRequest):
     """Create a harvester proof record with image and location data"""
-    logger.info(f"Creating harvester proof for tree: {proof_data.treeId}")
+    logger.info(
+        f"Creating harvester proof",
+        extra={
+            "tree_id": proof_data.treeId,
+            "plot_id": proof_data.plotId,
+            "harvester_id": proof_data.harvesterId,
+            "has_location": bool(proof_data.latitude and proof_data.longitude)
+        }
+    )
 
     try:
         pool = await get_pool()
@@ -735,11 +901,18 @@ async def create_harvester_proof(request: Request, proof_data: HarvesterProofReq
                 proof_data.accuracy, proof_data.notes, proof_data.harvesterId,
                 proof_data.clientId)
 
-            logger.info(f"Harvester proof created: {proof_id} for tree {proof_data.treeId}")
+            logger.info(
+                f"Harvester proof created",
+                extra={"proof_id": proof_id, "tree_id": proof_data.treeId, "plot_id": proof_data.plotId}
+            )
             return {"proofId": proof_id, "status": "success", "timestamp": now_ms()}
 
     except Exception as e:
-        logger.error(f"Harvester proof creation failed: {e}")
+        logger.error(
+            f"Harvester proof creation failed",
+            extra={"tree_id": proof_data.treeId, "error": str(e)},
+            exc_info=True
+        )
         raise HTTPException(500, f"Internal server error: {str(e)}")
 
 @app.post("/api/tree-locations")
@@ -870,7 +1043,10 @@ async def get_analytics_dashboard(
 @limiter.limit("10/minute")
 async def process_blob_images(request: Request, image_data: ImageListRequest):
     """Process a list of images already uploaded to blob storage with enhanced validation"""
-    logger.info(f"Processing {len(image_data.images)} blob images")
+    logger.info(
+        f"Processing blob images batch",
+        extra={"image_count": len(image_data.images)}
+    )
 
     try:
         processed = 0
@@ -879,7 +1055,10 @@ async def process_blob_images(request: Request, image_data: ImageListRequest):
 
         for i, item in enumerate(image_data.images):
             try:
-                logger.debug(f"Processing image {i+1}/{len(image_data.images)}")
+                logger.debug(
+                    f"Processing image",
+                    extra={"index": i + 1, "total": len(image_data.images), "url": item.url}
+                )
 
                 if not item.url:
                     errors.append({"index": i, "reason": "no URL provided"})
@@ -958,10 +1137,22 @@ async def process_blob_images(request: Request, image_data: ImageListRequest):
                 processed += 1
 
             except Exception as e:
-                logger.error(f"Error processing image {i}: {e}")
+                logger.error(
+                    f"Error processing image",
+                    extra={"index": i, "error": str(e)},
+                    exc_info=True
+                )
                 errors.append({"index": i, "error": str(e)})
 
-        logger.info(f"Image processing complete: {processed} processed, {len(errors)} errors")
+        logger.info(
+            f"Image batch processing complete",
+            extra={
+                "total_images": len(image_data.images),
+                "processed": processed,
+                "errors": len(errors),
+                "success_rate": f"{(processed / len(image_data.images) * 100):.1f}%" if image_data.images else "0%"
+            }
+        )
         return {
             "processed": processed,
             "errors": errors,
@@ -969,5 +1160,9 @@ async def process_blob_images(request: Request, image_data: ImageListRequest):
         }
 
     except Exception as e:
-        logger.error(f"Image list processing failed: {e}")
+        logger.error(
+            f"Image list processing failed",
+            extra={"error": str(e)},
+            exc_info=True
+        )
         raise HTTPException(500, f"Internal server error: {str(e)}")
