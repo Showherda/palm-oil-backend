@@ -994,6 +994,53 @@ async def create_harvester_proof(request: Request, proof_data: HarvesterProofReq
         )
         raise HTTPException(500, f"Internal server error: {str(e)}")
 
+@app.get("/api/tree-locations/{plot_id}")
+@limiter.limit("100/minute")
+async def get_tree_locations(
+    plot_id: str,
+    request: Request,
+    limit: int = Query(1000, le=5000),
+    offset: int = Query(0, ge=0)
+):
+    """Get all tree locations for a specific plot"""
+    logger.info(
+        f"Retrieving tree locations for plot",
+        extra={"plot_id": plot_id, "limit": limit, "offset": offset}
+    )
+
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            query = """
+                SELECT * FROM tree_locations
+                WHERE plot_id = $1
+                ORDER BY tree_id ASC
+                LIMIT $2 OFFSET $3
+            """
+            rows = await conn.fetch(query, plot_id, limit, offset)
+
+            # Get total count
+            total = await conn.fetchval("SELECT COUNT(*) FROM tree_locations WHERE plot_id = $1", plot_id)
+
+            locations = [dict(row) for row in rows]
+            logger.info(
+                f"Tree locations retrieved successfully",
+                extra={"plot_id": plot_id, "count": len(locations), "total": total}
+            )
+            return {
+                "locations": locations,
+                "total": total,
+                "hasMore": offset + len(locations) < total
+            }
+
+    except Exception as e:
+        logger.error(
+            f"Failed to retrieve tree locations for plot",
+            extra={"plot_id": plot_id, "error": str(e)},
+            exc_info=True
+        )
+        raise HTTPException(500, "Internal server error")
+
 @app.post("/api/tree-locations")
 @limiter.limit("100/minute")
 async def create_tree_location(request: Request, location_data: TreeLocationRequest):
