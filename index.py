@@ -466,17 +466,27 @@ async def validate_uploaded_file(file_content: bytes, filename: str, max_size_mb
 
 def contains_malicious_content(file_content: bytes) -> bool:
     """Scans file content for malicious patterns"""
-    # Check for embedded scripts or executables
-    malicious_patterns = [
+    # Text-based malicious patterns (case-insensitive)
+    text_patterns = [
         b'<script', b'javascript:', b'vbscript:',
-        b'<?php', b'<%', b'exec(', b'eval(',
-        b'\x4d\x5a',  # DOS/Windows executable header
+        b'<?php', b'<%', b'exec(', b'eval('
+    ]
+
+    # Binary executable headers (case-sensitive)
+    binary_patterns = [
+        b'\x4d\x5a',  # DOS/Windows executable header (MZ)
         b'\x7f\x45\x4c\x46'  # ELF executable header
     ]
 
+    # Check text patterns case-insensitively
     content_lower = file_content.lower()
-    for pattern in malicious_patterns:
+    for pattern in text_patterns:
         if pattern in content_lower:
+            return True
+
+    # Check binary patterns case-sensitively (on original content)
+    for pattern in binary_patterns:
+        if pattern in file_content:
             return True
 
     return False
