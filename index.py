@@ -3,7 +3,7 @@
 # Comprehensive data collection with recon forms, harvester proofs, and tree locations
 # Enhanced security, validation, and database operations
 
-import os, io, time, hashlib, re
+import os, io, time, hashlib, re, json
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from urllib.parse import urlparse
@@ -1254,6 +1254,9 @@ async def process_blob_images(request: Request, image_data: ImageListRequest):
                         continue
 
                     # Insert enhanced image record
+                    # Convert EXIF dict to JSON string for JSONB column
+                    exif_json = json.dumps(metadata.get('exif')) if metadata.get('exif') else None
+
                     image_id = await conn.fetchval("""
                         INSERT INTO images(
                             form_id, form_type, url, filename, original_filename,
@@ -1263,7 +1266,7 @@ async def process_blob_images(request: Request, image_data: ImageListRequest):
                     """, form_id, "recon", item.url, item.filename, item.filename,
                         checksum, metadata.get('file_size'), magic.from_buffer(img_bytes, mime=True) if magic else None,
                         metadata.get('width'), metadata.get('height'),
-                        metadata.get('exif'), now_ms(), "processed")
+                        exif_json, now_ms(), "processed")
 
                 associations.append({
                     "imageId": image_id,
